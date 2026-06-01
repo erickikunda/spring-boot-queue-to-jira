@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: support
+      POSTGRES_USER: support_user
+      POSTGRES_PASSWORD: support_password
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support_user -d support"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports: ["5672:5672", "15672:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  jira-ticket-service:
+    build: .
+    ports: ["8082:8082"]
+    environment:
+      DB_PASSWORD: support_password
+      JIRA_BASE_URL: ${JIRA_BASE_URL:-https://company.atlassian.net}
+      JIRA_EMAIL: ${JIRA_EMAIL:-dev@example.com}
+      JIRA_API_TOKEN: ${JIRA_API_TOKEN:-fake-token}
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }

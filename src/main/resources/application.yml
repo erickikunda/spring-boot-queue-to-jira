@@ -1,0 +1,50 @@
+server:
+  port: 8082
+spring:
+  application:
+    name: jira-ticket-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/support}
+    username: ${DB_USERNAME:support_user}
+    password: ${DB_PASSWORD:support_password}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+app:
+  jira:
+    base-url: ${JIRA_BASE_URL:https://company.atlassian.net}
+    email: ${JIRA_EMAIL:dev@example.com}
+    api-token: ${JIRA_API_TOKEN:fake-token}
+    project-key: ${JIRA_PROJECT_KEY:SUP}
+    issue-type: ${JIRA_ISSUE_TYPE:Support Request}
+  queue:
+    exchange: support.escalations.exchange
+    escalation-queue: support.escalations.jira.queue
+    dead-letter-queue: support.escalations.jira.dlq
+    routing-key: support.escalation.requested
+    dead-letter-routing-key: support.escalation.dead-letter
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+resilience4j:
+  retry:
+    instances:
+      jiraApi:
+        max-attempts: 3
+        wait-duration: 500ms
+        retry-exceptions:
+          - com.example.jiraticketservice.exception.RetryableJiraException
+  circuitbreaker:
+    instances:
+      jiraApi:
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
