@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jira Ticket Service - System Design</title>
+  <style>
+    :root { --ink:#17212b; --muted:#556270; --line:#dbe2e8; --soft:#f5f8fa; --accent:#0969da; --good:#1a7f37; --warn:#9a6700; }
+    * { box-sizing:border-box; } body { margin:0; color:var(--ink); background:#fff; font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1120px; margin:auto; padding:40px 28px 72px; } h1,h2,h3 { line-height:1.2; margin-top:1.6em; }
+    h1 { margin-top:0; font-size:2.3rem; } h2 { border-bottom:1px solid var(--line); padding-bottom:8px; font-size:1.55rem; } h3 { font-size:1.1rem; }
+    .subtitle,.muted { color:var(--muted); } .badge { display:inline-block; margin:0 6px 6px 0; padding:3px 9px; border-radius:14px; background:#ddf4ff; color:#0550ae; font-size:.83rem; }
+    .card-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; } .card { border:1px solid var(--line); border-radius:8px; padding:14px 16px; background:#fff; } .card h3 { margin:0 0 6px; }
+    code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; } code { background:var(--soft); padding:2px 5px; border-radius:4px; }
+    pre { overflow:auto; padding:14px; border:1px solid var(--line); border-radius:7px; background:var(--soft); font-size:.88rem; }
+    table { width:100%; border-collapse:collapse; margin:12px 0 18px; font-size:.94rem; } th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; } th { background:var(--soft); }
+    .diagram { overflow:auto; padding:16px; border:1px solid var(--line); border-radius:8px; background:#fbfcfd; } .diagram pre { margin:0; border:0; background:transparent; line-height:1.35; }
+    .note { padding:12px 14px; border-left:4px solid var(--accent); background:#f6faff; } .limit { padding:12px 14px; border-left:4px solid var(--warn); background:#fff8c5; } .ok { color:var(--good); font-weight:600; }
+    nav { columns:2; padding:12px 18px; border:1px solid var(--line); border-radius:8px; background:var(--soft); } nav a { color:var(--accent); text-decoration:none; }
+    @media (max-width:700px) { nav { columns:1; } main { padding:24px 16px 48px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Jira Ticket Service</h1>
+  <p class="subtitle">System design based on the implemented Spring Boot queue-to-Jira microservice</p>
+  <p><span class="badge">Java 21</span><span class="badge">Spring Boot</span><span class="badge">Spring AMQP</span><span class="badge">PostgreSQL</span><span class="badge">Flyway</span><span class="badge">WebClient</span><span class="badge">Resilience4j</span><span class="badge">Micrometer</span></p>
+
+  <nav><ol>
+    <li><a href="#purpose">Purpose</a></li><li><a href="#architecture">Architecture</a></li>
+    <li><a href="#flow">Processing flow</a></li><li><a href="#idempotency">Idempotency</a></li>
+    <li><a href="#rabbit">RabbitMQ</a></li><li><a href="#jira">Jira integration</a></li>
+    <li><a href="#data">Data model</a></li><li><a href="#observability">Observability</a></li>
+    <li><a href="#config">Configuration</a></li><li><a href="#operations">Operations</a></li>
+    <li><a href="#limits">Current limits</a></li>
+  </ol></nav>
+
+  <h2 id="purpose">1. Purpose</h2>
+  <p>This service consumes low-confidence chatbot escalation events from RabbitMQ and creates Jira support tickets. It enriches tickets with conversation context, records every Jira attempt, prevents duplicate ticket creation, and exposes operational metrics.</p>
+  <div class="note"><strong>Boundary:</strong> the chatbot decides when escalation is needed. This service does not run retrieval, generate answers, or decide confidence thresholds.</div>
+
+  <h2 id="architecture">2. Architecture</h2>
+  <div class="diagram"><pre>
+Python Chatbot Service
+       |
+       | support_escalation_requested
+       v
+RabbitMQ direct exchange: support.escalations.exchange
+       |
+       v
+queue: support.escalations.jira.queue
+       |
+       v
+EscalationEventConsumer
+       |
+       v
+JiraTicketOrchestrator -------> PostgreSQL
+       |                           |
+       |                           +-- escalations
+       |                           +-- messages
+       |                           +-- processed_events
+       |                           +-- jira_ticket_attempts
+       v
+JiraClient --> Jira Cloud POST /rest/api/3/issue
+
+Invalid or exhausted messages --> support.escalations.jira.dlq
+  </pre></div>
+
+  <div class="card-grid">
+    <div class="card"><h3>Consumer</h3><code>consumer/</code><p>Deserializes queue messages and rejects malformed or permanent failures.</p></div>
+    <div class="card"><h3>Orchestration</h3><code>service/</code><p>Validation, claims, context loading, issue construction, attempt audit, and idempotency.</p></div>
+    <div class="card"><h3>Jira boundary</h3><code>jira/</code><p>WebClient request, response models, and HTTP error classification.</p></div>
+    <div class="card"><h3>Persistence</h3><code>entity/</code>, <code>repository/</code><p>JPA entities and Flyway-managed PostgreSQL tables.</p></div>
+  </div>
+
+  <h2 id="flow">3. Event Processing Flow</h2>
+  <ol>
+    <li><code>EscalationEventConsumer</code> receives a raw RabbitMQ message and increments the consumed metric.</li>
+    <li>Jackson deserializes the JSON into <code>SupportEscalationRequestedEvent</code>.</li>
+    <li><code>EventValidator</code> checks required fields, event type, and confidence range.</li>
+    <li><code>IdempotencyService</code> checks whether <code>eventId</code> already exists in <code>processed_events</code>.</li>
+    <li><code>EscalationService</code> atomically claims the escalation row by updating it to <code>PROCESSING</code>.</li>
+    <li><code>ConversationContextService</code> loads the newest 20 conversation messages and returns them chronologically.</li>
+    <li><code>JiraIssueBuilder</code> produces the Jira fields payload.</li>
+    <li><code>JiraClient</code> calls Jira and classifies errors.</li>
+    <li>Success updates the escalation to <code>TICKET_CREATED</code>, records the audit attempt, and inserts the processed event.</li>
+    <li>Failures are recorded, the escalation becomes <code>FAILED</code>, and retryability determines queue behavior.</li>
+  </ol>
+  <p>Database operations use short transactional service methods. The outbound Jira request is not wrapped in a database transaction.</p>
+
+  <h2 id="idempotency">4. Idempotency and Concurrency</h2>
+  <p>The implementation protects the “at most one Jira ticket per escalation” invariant at three layers:</p>
+  <table><thead><tr><th>Protection</th><th>Implementation</th></tr></thead><tbody>
+    <tr><td>Repeated event ID</td><td><code>processed_events.event_id</code> is the primary key and is checked before processing.</td></tr>
+    <tr><td>Existing Jira ticket</td><td>The atomic claim requires <code>jira_ticket_key IS NULL</code>.</td></tr>
+    <tr><td>Concurrent workers</td><td>The atomic update only claims rows in <code>PENDING</code>, <code>QUEUED</code>, or <code>FAILED</code>.</td></tr>
+  </tbody></table>
+  <pre>UPDATE escalations
+SET status = 'PROCESSING', updated_at = now()
+WHERE id = :id
+  AND status IN ('PENDING', 'QUEUED', 'FAILED')
+  AND jira_ticket_key IS NULL;</pre>
+
+  <h2 id="rabbit">5. RabbitMQ Behavior</h2>
+  <table><thead><tr><th>Resource</th><th>Name</th></tr></thead><tbody>
+    <tr><td>Direct exchange</td><td><code>support.escalations.exchange</code></td></tr>
+    <tr><td>Escalation queue</td><td><code>support.escalations.jira.queue</code></td></tr>
+    <tr><td>Routing key</td><td><code>support.escalation.requested</code></td></tr>
+    <tr><td>Dead-letter queue</td><td><code>support.escalations.jira.dlq</code></td></tr>
+    <tr><td>Dead-letter routing key</td><td><code>support.escalation.dead-letter</code></td></tr>
+  </tbody></table>
+  <p>Malformed JSON, invalid events, and non-retryable Jira failures are rejected without requeue. Other failures bubble through a stateless listener retry interceptor with three attempts before rejection and dead-letter routing.</p>
+
+  <h2 id="jira">6. Jira Integration</h2>
+  <p><code>JiraClient</code> uses a basic-auth <code>WebClient</code> and posts to <code>/rest/api/3/issue</code>. The browser URL is derived as <code>{baseUrl}/browse/{key}</code>.</p>
+  <table><thead><tr><th>Category</th><th>Behavior</th></tr></thead><tbody>
+    <tr><td>Retryable</td><td>HTTP <code>429</code>, all <code>5xx</code> responses, and WebClient network failures.</td></tr>
+    <tr><td>Non-retryable</td><td>Other Jira HTTP errors, including validation and authorization failures.</td></tr>
+    <tr><td>Resilience4j</td><td><code>jiraApi</code> retry: three attempts, 500 ms delay. Circuit breaker: sliding window 10, minimum calls 5.</td></tr>
+  </tbody></table>
+  <p>The issue builder creates a truncated summary, detailed plain-text description, support labels, optional sanitized product label, and priority. Priority is <code>High</code> when <code>priorityHint=high</code> or confidence is below <code>0.30</code>; otherwise it is <code>Medium</code>.</p>
+
+  <h2 id="data">7. Data Model</h2>
+  <table><thead><tr><th>Table</th><th>Purpose</th><th>Important fields</th></tr></thead><tbody>
+    <tr><td><code>escalations</code></td><td>Shared escalation lifecycle</td><td><code>status</code>, confidence details, Jira key, Jira URL, error</td></tr>
+    <tr><td><code>messages</code></td><td>Conversation context loaded into Jira description</td><td><code>conversation_id</code>, <code>role</code>, <code>content</code>, <code>created_at</code></td></tr>
+    <tr><td><code>processed_events</code></td><td>Event-level idempotency marker</td><td><code>event_id</code> primary key, <code>escalation_id</code></td></tr>
+    <tr><td><code>jira_ticket_attempts</code></td><td>Audit trail for Jira calls</td><td>attempt number, status, HTTP status, error, request JSON, response JSON</td></tr>
+  </tbody></table>
+  <p>Flyway migrations <code>V1</code> through <code>V4</code> create the schema and supporting indexes.</p>
+
+  <h2 id="observability">8. Observability</h2>
+  <p>Spring Boot Actuator exposes <code>/actuator/health</code>, <code>/actuator/info</code>, <code>/actuator/metrics</code>, and <code>/actuator/prometheus</code>.</p>
+  <table><thead><tr><th>Metric</th><th>Type</th></tr></thead><tbody>
+    <tr><td><code>jira_ticket_events_consumed_total</code></td><td>Counter</td></tr>
+    <tr><td><code>jira_ticket_created_total</code></td><td>Counter</td></tr>
+    <tr><td><code>jira_ticket_failed_total</code></td><td>Counter</td></tr>
+    <tr><td><code>jira_ticket_duplicate_ignored_total</code></td><td>Counter</td></tr>
+    <tr><td><code>jira_ticket_invalid_event_total</code></td><td>Counter</td></tr>
+    <tr><td><code>jira_api_latency</code></td><td>Timer</td></tr>
+    <tr><td><code>queue_message_processing_latency</code></td><td>Timer</td></tr>
+  </tbody></table>
+  <p>Successful and duplicate flows log event ID, escalation ID, conversation ID, ticket key when available, and status. Full conversation bodies are not logged.</p>
+
+  <h2 id="config">9. Configuration</h2>
+  <table><thead><tr><th>Environment variable</th><th>Purpose</th><th>Default</th></tr></thead><tbody>
+    <tr><td><code>DB_URL</code></td><td>PostgreSQL JDBC URL</td><td><code>jdbc:postgresql://localhost:5432/support</code></td></tr>
+    <tr><td><code>DB_USERNAME</code></td><td>Database user</td><td><code>support_user</code></td></tr>
+    <tr><td><code>DB_PASSWORD</code></td><td>Database password</td><td><code>support_password</code></td></tr>
+    <tr><td><code>JIRA_BASE_URL</code></td><td>Jira Cloud base URL</td><td><code>https://company.atlassian.net</code></td></tr>
+    <tr><td><code>JIRA_EMAIL</code></td><td>Jira basic-auth email</td><td><code>dev@example.com</code></td></tr>
+    <tr><td><code>JIRA_API_TOKEN</code></td><td>Jira basic-auth token</td><td><code>fake-token</code></td></tr>
+    <tr><td><code>JIRA_PROJECT_KEY</code></td><td>Target Jira project</td><td><code>SUP</code></td></tr>
+    <tr><td><code>JIRA_ISSUE_TYPE</code></td><td>Target Jira issue type</td><td><code>Support Request</code></td></tr>
+  </tbody></table>
+
+  <h2 id="operations">10. Deployment and Verification</h2>
+  <p><code>docker-compose.yml</code> starts PostgreSQL 16, RabbitMQ with management UI, and the Jira service on port <code>8082</code>. The Dockerfile builds a Java 21 runnable jar in a Maven stage and runs it with a Temurin 21 JRE.</p>
+  <p class="ok">Verified locally: Maven compilation, runnable jar packaging, 12 executable unit tests, and four Docker-backed integration scenarios present for PostgreSQL, RabbitMQ, and WireMock. The container scenarios require Docker Desktop.</p>
+
+  <h2 id="limits">11. Current Implementation Limits</h2>
+  <div class="limit"><ul>
+    <li>The Jira description is plain text. Atlassian Document Format is not implemented.</li>
+    <li>The listener retry interceptor retries uncategorized runtime failures as well as retryable Jira failures before dead-lettering.</li>
+    <li>The audit attempt number uses <code>count + 1</code>; concurrent retry recording is not guarded by a unique database constraint.</li>
+    <li>Invalid events are rejected to the DLQ but are not persisted with <code>INVALID_EVENT</code> status when deserialization prevents a usable escalation ID.</li>
+    <li>The service expects the chatbot service to create the escalation row before queue publication.</li>
+    <li>Docker Compose points directly at Jira unless <code>JIRA_BASE_URL</code> is overridden; a local WireMock container is not included.</li>
+  </ul></div>
+
+  <h2>12. Source Map</h2>
+  <table><thead><tr><th>Area</th><th>Primary implementation file</th></tr></thead><tbody>
+    <tr><td>Queue declaration and retries</td><td><code>config/RabbitConfig.java</code></td></tr>
+    <tr><td>Queue consumer</td><td><code>consumer/EscalationEventConsumer.java</code></td></tr>
+    <tr><td>Business orchestration</td><td><code>service/JiraTicketOrchestrator.java</code></td></tr>
+    <tr><td>Atomic claim</td><td><code>repository/EscalationRepository.java</code>, <code>service/EscalationService.java</code></td></tr>
+    <tr><td>Jira request</td><td><code>jira/JiraClient.java</code>, <code>service/JiraIssueBuilder.java</code></td></tr>
+    <tr><td>Attempt audit</td><td><code>service/JiraTicketAttemptService.java</code></td></tr>
+    <tr><td>Schema</td><td><code>src/main/resources/db/migration/</code></td></tr>
+  </tbody></table>
+  <p class="muted">Document generated from the implemented repository structure and behavior.</p>
+</main>
+</body>
+</html>
